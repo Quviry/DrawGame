@@ -49,8 +49,8 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir artifact
-          cp build/Release/DrawGame.exe artifact/
-          # Проверяем что exe работает (--help)
+          find build -name "DrawGame.exe" -type f
+          cp build/DrawGame.exe artifact/ || cp build/Release/DrawGame.exe artifact/
           artifact/DrawGame.exe --help || true
         shell: bash
 
@@ -101,8 +101,7 @@ jobs:
       - name: Prepare artifact
         run: |
           mkdir artifact
-          find build -name "DrawGame.exe" -type f
-          cp build/DrawGame.exe artifact/ || cp build/Release/DrawGame.exe artifact/
+          cp build/DrawGame artifact/
           chmod +x artifact/DrawGame
           # Проверяем линковку
           ldd artifact/DrawGame || true
