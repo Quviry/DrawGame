@@ -1,0 +1,305 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Триггер на теги вида v1.0.0, v0.1.0 и т.д.
+  workflow_dispatch:  # Ручной запуск
+    inputs:
+      tag_name:
+        description: 'Release tag name (e.g. v1.0.0)'
+        required: true
+        default: 'v0.0.1-dev'
+
+# Разрешения для создания релизов
+permissions:
+  contents: write
+
+jobs:
+  # ============================================================
+  # Windows
+  # ============================================================
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Install dependencies
+        run: |
+          choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System' -y
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Prepare artifact
+        run: |
+          mkdir artifact
+          cp build/Release/DrawGame.exe artifact/
+          # Проверяем что exe работает (--help)
+          artifact/DrawGame.exe --help || true
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DrawGame-windows-x64
+          path: artifact/DrawGame.exe
+          retention-days: 5
+
+  # ============================================================
+  # Ubuntu 20.04
+  # ============================================================
+  build-linux:
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libgl1-mesa-dev \
+            libglu1-mesa-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxext-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-10 \
+            -DCMAKE_CXX_COMPILER=g++-10
+
+      - name: Build
+        run: cmake --build build --config Release --parallel $(nproc)
+
+      - name: Prepare artifact
+        run: |
+          mkdir artifact
+          cp build/DrawGame artifact/
+          chmod +x artifact/DrawGame
+          # Проверяем линковку
+          ldd artifact/DrawGame || true
+          artifact/DrawGame --help || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DrawGame-linux-x64
+          path: artifact/DrawGame
+          retention-days: 5
+
+  # ============================================================
+  # macOS (Universal Binary: x86_64 + arm64)
+  # ============================================================
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          brew install cmake
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="11.0"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel $(sysctl -n hw.ncpu)
+
+      - name: Verify universal binary
+        run: |
+          file build/DrawGame
+          lipo -info build/DrawGame || true
+
+      - name: Create macOS app bundle
+        run: |
+          mkdir -p artifact/DrawGame.app/Contents/MacOS
+          mkdir -p artifact/DrawGame.app/Contents/Resources
+
+          cp build/DrawGame artifact/DrawGame.app/Contents/MacOS/
+
+          # Info.plist
+          cat > artifact/DrawGame.app/Contents/Info.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>DrawGame</string>
+            <key>CFBundleDisplayName</key>
+            <string>DrawGame</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.drawgame.app</string>
+            <key>CFBundleVersion</key>
+            <string>1.0.0</string>
+            <key>CFBundleShortVersionString</key>
+            <string>1.0.0</string>
+            <key>CFBundleExecutable</key>
+            <string>DrawGame</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>11.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+            <key>NSSupportsAutomaticGraphicsSwitching</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Также копируем голый бинарник
+          cp build/DrawGame artifact/DrawGame
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "DrawGame" \
+            -srcfolder artifact/DrawGame.app \
+            -ov -format UDZO \
+            artifact/DrawGame-macOS.dmg
+
+      - name: Upload app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: DrawGame-macOS-universal
+          path: |
+            artifact/DrawGame-macOS.dmg
+            artifact/DrawGame
+          retention-days: 5
+
+  # ============================================================
+  # Создание релиза
+  # ============================================================
+  create-release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG_NAME=${{ github.event.inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts
+        run: find artifacts/ -type f -ls
+
+      - name: Prepare release assets
+        run: |
+          mkdir release
+
+          # Windows
+          cd artifacts/DrawGame-windows-x64
+          zip ../../release/DrawGame-windows-x64.zip DrawGame.exe
+          cd ../..
+
+          # Linux
+          cd artifacts/DrawGame-linux-x64
+          chmod +x DrawGame
+          tar czf ../../release/DrawGame-linux-x64.tar.gz DrawGame
+          cd ../..
+
+          # macOS
+          cp artifacts/DrawGame-macOS-universal/DrawGame-macOS.dmg \
+             release/DrawGame-macOS-universal.dmg
+          # Также tar.gz с бинарником
+          cd artifacts/DrawGame-macOS-universal
+          chmod +x DrawGame
+          tar czf ../../release/DrawGame-macOS-binary.tar.gz DrawGame
+          cd ../..
+
+          ls -la release/
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          cat > release/RELEASE_NOTES.md << 'EOF'
+          ## DrawGame ${{ steps.tag.outputs.TAG_NAME }}
+
+          ### Downloads
+
+          | Platform | File | Notes |
+          |----------|------|-------|
+          | **Windows 10+** | `DrawGame-windows-x64.zip` | Extract and run `DrawGame.exe` |
+          | **Ubuntu 20.04+** | `DrawGame-linux-x64.tar.gz` | Extract, `chmod +x DrawGame`, run |
+          | **macOS 11+** | `DrawGame-macOS-universal.dmg` | Mount DMG, drag to Applications |
+          | **macOS (binary)** | `DrawGame-macOS-binary.tar.gz` | Universal binary (Intel + Apple Silicon) |
+
+          ### Usage
+          ```
+          # Local mode (single player)
+          ./DrawGame
+
+          # Host a server (open for others)
+          ./DrawGame --open --port 7777
+
+          # Connect to a server
+          ./DrawGame --connect 192.168.1.100 7777
+          ```
+
+          ### Controls
+          - **Left Mouse** — Draw
+          - **Right Mouse** — Color picker
+          - **+/-** — Brush size
+          - **Ctrl+C** — Clear canvas
+          - **Ctrl+S** — Export to BMP
+          - **Escape** — Quit
+
+          ### Requirements
+          - **Windows**: No additional dependencies
+          - **Linux**: OpenGL drivers, X11 (`sudo apt install libgl1-mesa-glx`)
+          - **macOS**: macOS 11.0 Big Sur or later
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG_NAME }}
+          name: "DrawGame ${{ steps.tag.outputs.TAG_NAME }}"
+          body_path: release/RELEASE_NOTES.md
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.TAG_NAME, 'dev') || contains(steps.tag.outputs.TAG_NAME, 'rc') }}
+          files: |
+            release/DrawGame-windows-x64.zip
+            release/DrawGame-linux-x64.tar.gz
+            release/DrawGame-macOS-universal.dmg
+            release/DrawGame-macOS-binary.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
